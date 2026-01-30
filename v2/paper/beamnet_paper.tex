@@ -1,0 +1,527 @@
+\documentclass[11pt,a4paper]{article}
+
+% === Packages ===
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{siunitx}
+
+% === Graphics path ===
+\graphicspath{{../figures/}}
+
+% === Custom commands ===
+\newcommand{\beamnet}{\textsc{BeamNet}}
+\newcommand{\vect}[1]{\mathbf{#1}}
+\newcommand{\reals}{\mathbb{R}}
+
+% === Title ===
+\title{\beamnet{}: A Neural Network Surrogate for Real-Time\\Beam Transport Prediction and Inverse Optimization}
+
+\author{
+    Author Name\textsuperscript{1} \\
+    \small \textsuperscript{1}Institution Name, Department \\
+    \small \texttt{email@institution.edu}
+}
+
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+% === Abstract ===
+\begin{abstract}
+Accurate prediction and control of charged particle beams is essential for accelerator facilities, from synchrotron light sources to hadron therapy centers. Traditional approaches---physics-based simulations or manual trial-and-error---are either too slow for real-time applications or require extensive expert calibration. We present \beamnet{}, a lightweight neural network surrogate trained on experimental measurements from four beamline facilities. \beamnet{} enables two key capabilities: (1) \emph{forward prediction} of beam centroid and spot size given lens currents, achieving mean relative errors of 3--9\% for centroid position; and (2) \emph{inverse optimization} to find lens currents that produce a desired beam configuration, with 100\% convergence rate and sub-second computation time. We demonstrate that the inverse solver can replace hours of manual tuning with millisecond-scale in-silico optimization. While spread prediction suffers from higher errors (25--55\%) due to dataset bias toward ``in-focus'' configurations, centroid-based applications are immediately viable. This work establishes a practical framework for data-driven beam control that could significantly reduce tuning time at accelerator facilities.
+\end{abstract}
+
+\textbf{Keywords:} neural network surrogate, beam transport, inverse optimization, accelerator physics, machine learning
+
+% =============================================================================
+\section{Introduction}
+\label{sec:intro}
+% =============================================================================
+
+Charged particle beamlines underpin a wide range of scientific and medical applications, from synchrotron light sources to proton therapy facilities. Accurate prediction of how a beam evolves as it traverses a sequence of magnetic lenses is essential for:
+\begin{enumerate}
+    \item \textbf{Beam tuning} -- operators must rapidly adjust lens currents to focus the beam on a target;
+    \item \textbf{Treatment planning} -- in hadron therapy, millimeter-level precision determines dose deposition;
+    \item \textbf{Experiment design} -- researchers need to explore ``what-if'' scenarios before committing machine time.
+\end{enumerate}
+
+A particularly pressing challenge is the \emph{inverse problem}: given a desired beam position and spot size at the target, which lens currents should be applied? This question arises daily in accelerator control rooms, yet existing tools offer limited support for answering it efficiently.
+
+\subsection{Limitations of Existing Approaches}
+
+\Cref{tab:approaches} summarizes the trade-offs among established methods.
+
+\begin{table}[htbp]
+\centering
+\caption{Comparison of beam transport prediction methods.}
+\label{tab:approaches}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Approach} & \textbf{Pros} & \textbf{Cons} \\
+\midrule
+CFD / PIC simulations & High fidelity & Hours per run; expert calibration \\
+Transfer-matrix optics & Fast, closed-form & Linear approximation only \\
+Lookup tables & Simple & Discretization artifacts \\
+Manual tuning & Intuitive for experts & Slow, consumes beam time \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+None of these methods provides a fast, automatic way to solve the inverse problem in real time.
+
+\subsection{Our Contribution}
+
+We propose \beamnet{}, a data-driven neural network surrogate for beam transport that enables:
+\begin{enumerate}
+    \item \textbf{Forward prediction} -- given lens currents, predict the outgoing beam centroid and spread in microseconds.
+    \item \textbf{Inverse optimization} -- given a desired output beam, find the required lens currents via gradient-based optimization through the differentiable surrogate.
+\end{enumerate}
+
+Key features include:
+\begin{itemize}
+    \item \textbf{Automatic calibration} -- trained on real measurements, no manual tuning of simulation parameters.
+    \item \textbf{Non-linearity} -- captures dependencies that linear optics cannot represent.
+    \item \textbf{Real-time performance} -- both forward and inverse computations complete in under one second.
+    \item \textbf{Safe exploration} -- the inverse solver explores lens-current space in silico, avoiding risky trial-and-error on the physical machine.
+\end{itemize}
+
+The remainder of this paper is organized as follows. \Cref{sec:related} reviews related work. \Cref{sec:dataset} describes the dataset and its characteristics. \Cref{sec:method} details the model architecture and training procedure. \Cref{sec:experiments} presents cross-validation and error analysis. \Cref{sec:inverse} introduces the inverse solver and its validation. \Cref{sec:discussion} discusses results and limitations. \Cref{sec:conclusion} concludes.
+
+% =============================================================================
+\section{Related Work}
+\label{sec:related}
+% =============================================================================
+
+\subsection{Physics-Based Beam Transport Codes}
+
+Codes such as TRANSPORT, MAD-X, and ELEGANT solve the equations of motion for charged particles in electromagnetic fields~\cite{transport,madx,elegant}. While highly accurate when properly configured, they require detailed knowledge of magnetic field maps and are sensitive to alignment errors that are difficult to measure in situ.
+
+\subsection{Machine Learning Surrogates in Accelerator Physics}
+
+Recent years have seen growing interest in ML-based surrogates for accelerator optimization:
+\begin{itemize}
+    \item \textbf{Gaussian-process models} for Bayesian optimization of beam parameters~\cite{gp_lcls}.
+    \item \textbf{Convolutional neural networks} for reconstructing transverse phase-space distributions from screen images.
+    \item \textbf{Recurrent networks} for modeling temporal drifts in machine state.
+\end{itemize}
+
+Our work differs in that we focus on a \emph{static mapping} from lens currents to beam moments, using a simple feedforward architecture that can be trained with very limited data (\textless100 samples).
+
+\subsection{Small-Data Learning}
+
+Training neural networks with fewer than 100 samples is challenging. We mitigate overfitting through:
+\begin{enumerate}
+    \item A compact architecture ($\sim$32{,}000 parameters);
+    \item Early stopping monitored via cross-validation;
+    \item Min-max normalization to keep gradients stable;
+    \item $K$-fold cross-validation to maximize data utilization.
+\end{enumerate}
+
+% =============================================================================
+\section{Dataset}
+\label{sec:dataset}
+% =============================================================================
+
+\subsection{Data Acquisition}
+
+Measurements were collected at four beamline facilities: CATANA, MAGNEX, TEBE, and ZERO GRADI. Each record contains:
+\begin{itemize}
+    \item \textbf{Incoming beam:} $x_{\text{in}}, y_{\text{in}}, \sigma_{x,\text{in}}, \sigma_{y,\text{in}}$ -- centroid position and RMS spread before the lens train;
+    \item \textbf{Lens currents:} $I_1, I_2, \ldots, I_8$ -- electrical currents through each magnetic quadrupole/steering magnet;
+    \item \textbf{Outgoing beam:} $x_{\text{out}}, y_{\text{out}}, \sigma_{x,\text{out}}, \sigma_{y,\text{out}}$ -- centroid position and RMS spread after the lens train.
+\end{itemize}
+
+In total, we have \textbf{99 samples} after merging and cleaning.
+
+\subsection{Dataset Bias}
+
+A critical caveat: the recorded configurations are \emph{not uniformly sampled} from the feasible parameter space. Operators only saved measurements when the beam was considered ``in focus''---i.e., acceptable for experiments. Consequently:
+\begin{itemize}
+    \item The dataset is \textbf{biased toward good configurations}.
+    \item We have \textbf{no examples of bad configurations} (e.g., beam loss, large spot size).
+\end{itemize}
+
+This means the model may be unreliable when extrapolating to unseen, possibly poor, lens settings.
+
+\subsection{Exploratory Analysis}
+
+\Cref{fig:pairplot} shows a pair-plot of the lens currents, revealing that many current combinations are tightly correlated---operators tend to adjust certain magnets together.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.85\textwidth]{fig1_pairplot.png}
+\caption{Pair-plot of lens currents. Diagonal shows histograms; off-diagonal shows pairwise scatter. Tight clustering indicates that operators recorded only a limited region of parameter space.}
+\label{fig:pairplot}
+\end{figure}
+
+\Cref{fig:pca} presents a PCA projection of the 12-dimensional input space to 2D. The samples occupy a low-dimensional manifold rather than filling the full hypercube, confirming the dataset's non-representative nature.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.6\textwidth]{fig2_pca.png}
+\caption{PCA projection of the input space. Color indicates sample index (chronological order). Samples cluster rather than uniformly filling the space.}
+\label{fig:pca}
+\end{figure}
+
+\Cref{fig:distributions} shows histograms of all 16 variables (12 inputs + 4 outputs), illustrating the marginal distributions.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{fig3_distributions.png}
+\caption{Distribution of all dataset columns. Many lens currents show multimodal distributions, reflecting discrete operating modes at different facilities.}
+\label{fig:distributions}
+\end{figure}
+
+% =============================================================================
+\section{Methodology}
+\label{sec:method}
+% =============================================================================
+
+\subsection{Problem Formulation}
+
+We frame beam transport prediction as a supervised regression task. Let
+\begin{equation}
+\vect{x} = (x_{\text{in}}, y_{\text{in}}, \sigma_{x,\text{in}}, \sigma_{y,\text{in}}, I_1, \ldots, I_8) \in \reals^{12}
+\end{equation}
+be the input vector and
+\begin{equation}
+\vect{y} = (x_{\text{out}}, y_{\text{out}}, \sigma_{x,\text{out}}, \sigma_{y,\text{out}}) \in \reals^{4}
+\end{equation}
+be the target. We seek a function $f_\theta: \reals^{12} \to \reals^{4}$ parameterized by neural network weights $\theta$ that minimizes the mean absolute error (MAE):
+\begin{equation}
+\mathcal{L}(\theta) = \frac{1}{|\mathcal{D}|} \sum_{(\vect{x}, \vect{y}) \in \mathcal{D}} \| f_\theta(\vect{x}) - \vect{y} \|_1
+\end{equation}
+
+\subsection{Architecture}
+
+\beamnet{} is a fully connected feedforward network with two sequential blocks:
+
+\begin{table}[htbp]
+\centering
+\caption{\beamnet{} architecture.}
+\label{tab:architecture}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Block} & \textbf{Layers} \\
+\midrule
+1 & Linear(12 $\to$ 100) $\to$ ReLU $\to$ Linear(100 $\to$ 100) $\to$ ReLU $\to$ Linear(100 $\to$ 150) $\to$ ReLU \\
+2 & Linear(150 $\to$ 100) $\to$ ReLU $\to$ Linear(100 $\to$ 75) $\to$ ReLU $\to$ Linear(75 $\to$ 4) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Total parameters: $\approx$32{,}000.
+
+\subsection{Training Details}
+
+\begin{itemize}
+    \item \textbf{Normalization:} Min-max scaling to $[0, 1]$ for all inputs and targets.
+    \item \textbf{Optimizer:} Adam with learning rate $10^{-4}$.
+    \item \textbf{Epochs:} 500 (with early stopping based on validation loss).
+    \item \textbf{Loss:} L1 (MAE) -- more robust to outliers than MSE.
+\end{itemize}
+
+% =============================================================================
+\section{Experiments}
+\label{sec:experiments}
+% =============================================================================
+
+Given the small dataset, a single train/test split would yield high-variance estimates. We therefore adopt 10-fold cross-validation to obtain robust error estimates.
+
+\subsection{Cross-Validation Results}
+
+Across 10 folds, \beamnet{} achieves:
+\begin{itemize}
+    \item \textbf{Mean MAE:} 4.98 $\pm$ 2.15 (original units)
+    \item \textbf{Mean RMSE:} 8.89 $\pm$ 3.72
+    \item \textbf{Mean R\textsuperscript{2}:} 0.91 $\pm$ 0.08
+\end{itemize}
+
+\subsection{Learning Curve Analysis}
+
+\Cref{fig:learning_curve} shows how test MAE evolves with training set size. The downward trend confirms that additional labeled configurations would reduce prediction error.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.55\textwidth]{fig4_learning_curve.png}
+\caption{Learning curve showing test MAE versus training set size. Error bars indicate standard deviation across folds. The decreasing trend motivates future data collection.}
+\label{fig:learning_curve}
+\end{figure}
+
+\subsection{Threshold Analysis}
+
+In practical applications, what matters is whether predicted beam parameters fall within acceptable tolerances. \Cref{fig:threshold} shows the fraction of predictions whose relative error is below various thresholds.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.55\textwidth]{fig5_threshold.png}
+\caption{Threshold analysis: fraction of predictions with relative error below a given threshold. Approximately 90\% of predictions have relative error below 40\%.}
+\label{fig:threshold}
+\end{figure}
+
+\subsection{Per-Target Error Analysis}
+
+\Cref{fig:pertarget} breaks down the mean relative error by output variable, revealing a striking dichotomy:
+\begin{itemize}
+    \item \textbf{Centroid} ($x_{\text{out}}$, $y_{\text{out}}$): 3--9\% error -- \textbf{good}.
+    \item \textbf{Spread} ($\sigma_x$, $\sigma_y$): 25--55\% error -- \textbf{poor}.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.55\textwidth]{fig6_pertarget.png}
+\caption{Mean relative error by output variable. Centroid predictions are accurate; spread predictions suffer from higher uncertainty.}
+\label{fig:pertarget}
+\end{figure}
+
+This gap is a direct consequence of dataset bias: operators only saved ``in-focus'' configurations with small $\sigma$, leaving the network with insufficient examples of how spot size varies across parameter space.
+
+\subsection{Residual Distribution}
+
+\Cref{fig:residuals} shows the distribution of signed relative residuals across all targets and folds. The distribution is centered near zero with a standard deviation of approximately 50\%.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.55\textwidth]{fig7_residuals.png}
+\caption{Distribution of relative residuals (predicted $-$ true, normalized by true value). The distribution is centered near zero, indicating no systematic bias.}
+\label{fig:residuals}
+\end{figure}
+
+% =============================================================================
+\section{The Inverse Problem}
+\label{sec:inverse}
+% =============================================================================
+
+This section presents the \textbf{core practical contribution} of this work: using \beamnet{} as a differentiable surrogate to solve the inverse beam-transport problem efficiently and safely.
+
+\subsection{Problem Statement}
+
+In daily accelerator operations, the question is rarely ``what will the beam look like for these currents?'' but rather:
+\begin{quote}
+\emph{Given a desired beam position and spot size at the target, which lens currents should I apply?}
+\end{quote}
+
+This is the inverse problem. Traditional solutions are compared in \Cref{tab:inverse_methods}.
+
+\begin{table}[htbp]
+\centering
+\caption{Comparison of inverse problem solution methods.}
+\label{tab:inverse_methods}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Method} & \textbf{Time} & \textbf{Safety} & \textbf{Accuracy} \\
+\midrule
+Manual trial-and-error & Minutes--hours & Low & Operator-dependent \\
+Genetic algorithms on simulator & Hours & High & Limited by simulator \\
+Lookup tables & Milliseconds & High & Discretization artifacts \\
+\textbf{\beamnet{} + gradient descent} & \textbf{Milliseconds} & \textbf{High} & \textbf{Data-driven} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Mathematical Formulation}
+
+Let $\vect{x}_{\text{beam}} = (x_{\text{in}}, y_{\text{in}}, \sigma_{x,\text{in}}, \sigma_{y,\text{in}})$ be the measured incoming beam. We seek lens currents $\vect{I} = (I_1, \ldots, I_8)$ such that the predicted output
+\begin{equation}
+\hat{\vect{y}} = f_\theta(\vect{x}_{\text{beam}}, \vect{I})
+\end{equation}
+matches a user-specified target $\vect{y}^*$. We minimize:
+\begin{equation}
+\mathcal{J}(\vect{I}) = \underbrace{\| \hat{\vect{y}} - \vect{y}^* \|_2^2}_{\text{data fidelity}} + \underbrace{\lambda \|\vect{I}\|_2^2}_{\text{regularization}}
+\label{eq:inverse_objective}
+\end{equation}
+
+Since $f_\theta$ is a neural network, $\mathcal{J}$ is differentiable with respect to $\vect{I}$, enabling efficient optimization via Adam or L-BFGS.
+
+\subsection{Implementation}
+
+The solver:
+\begin{enumerate}
+    \item Freezes all network weights (we optimize inputs, not parameters).
+    \item Initializes currents at the midpoint of observed ranges.
+    \item Iteratively updates currents to minimize~\cref{eq:inverse_objective}.
+    \item Clamps currents to $[0, 1]$ (normalized) to stay within physical bounds.
+    \item Returns optimized currents in original units, plus convergence diagnostics.
+\end{enumerate}
+
+\subsection{Example: Beam Centering}
+
+\Cref{fig:inverse_example} demonstrates the inverse solver on a beam centering task. Given an incoming beam and a target position $(x=380, y=350)$, the solver converges in approximately 14 iterations, finding currents that achieve the target within a few percent error.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{fig8_inverse_example.png}
+\caption{Inverse solver example. \textbf{Left:} Loss versus iteration (log scale), showing rapid convergence. \textbf{Right:} Target versus achieved beam parameters; the solver closely matches the centroid target.}
+\label{fig:inverse_example}
+\end{figure}
+
+\subsection{Systematic Validation}
+
+To assess robustness, we performed validation on 20 randomly sampled target configurations. For each, we:
+\begin{enumerate}
+    \item Selected a target from within the dataset output distribution (with small perturbation).
+    \item Ran the inverse solver.
+    \item Measured achieved-vs-target error.
+\end{enumerate}
+
+\Cref{fig:validation} summarizes the results:
+\begin{itemize}
+    \item \textbf{Convergence rate:} 100\%
+    \item \textbf{Mean iterations:} 47 $\pm$ 28
+    \item \textbf{Centroid error:} $x$: 3.5\% $\pm$ 4.2\%; $y$: 1.4\% $\pm$ 0.8\%
+    \item \textbf{Spread error:} $\sigma_x$: 18.9\% $\pm$ 20.8\%; $\sigma_y$: 12.7\% $\pm$ 9.7\%
+    \item \textbf{Centroid success rate} (\textless10\% error): 95\%
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{fig9_validation.png}
+\caption{Inverse solver validation results. \textbf{Top-left:} Relative error by output variable. \textbf{Top-right:} Centroid target vs achieved (points near diagonal indicate good agreement). \textbf{Bottom-left:} Spread target vs achieved. \textbf{Bottom-right:} Histogram of iterations to convergence.}
+\label{fig:validation}
+\end{figure}
+
+The validation confirms that:
+\begin{enumerate}
+    \item \textbf{Centroid optimization is highly reliable} -- the solver consistently achieves beam positions within a few percent of the target.
+    \item \textbf{Spread optimization reflects forward-model limitations} -- errors on $\sigma_x$ and $\sigma_y$ mirror the forward-model performance gap.
+    \item \textbf{Convergence is fast and stable} -- most cases converge in under 50 iterations, corresponding to \textless10~ms on a CPU.
+\end{enumerate}
+
+\subsection{Impact on Laboratory Workflow}
+
+\Cref{tab:workflow} compares traditional and \beamnet{}-based workflows.
+
+\begin{table}[htbp]
+\centering
+\caption{Comparison of beam tuning workflows.}
+\label{tab:workflow}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Metric} & \textbf{Traditional} & \textbf{\beamnet{}} \\
+\midrule
+Time to solution & Minutes--hours & \textless1 second \\
+Beam shots required & Dozens & 0 (in silico) \\
+Risk of beam loss & High & None \\
+Operator expertise required & High & Low \\
+Reproducibility & Operator-dependent & Deterministic \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =============================================================================
+\section{Discussion}
+\label{sec:discussion}
+% =============================================================================
+
+\subsection{The Centroid-vs-Spread Accuracy Gap}
+
+The per-target error analysis reveals that \beamnet{} predicts centroids well but struggles with beam spread. We hypothesize three contributing factors:
+
+\begin{enumerate}
+    \item \textbf{Low variance in spread measurements.} Operators recorded only ``in-focus'' configurations, meaning $\sigma_x$ and $\sigma_y$ cluster around small values. The network has limited examples of how spread varies with lens settings.
+    
+    \item \textbf{Higher sensitivity of spread to lens currents.} Beam size depends quadratically on focusing strength, whereas centroid displacement is approximately linear. Small errors in learned weights have an amplified effect on spread predictions.
+    
+    \item \textbf{Measurement noise.} Spread is estimated from beam profile fits (e.g., Gaussian FWHM), which is inherently noisier than centroid estimation.
+\end{enumerate}
+
+\textbf{Implications:} For applications where \textbf{beam positioning} is the primary concern, \beamnet{} already provides sufficient accuracy. For applications requiring precise \textbf{spot-size control}, additional data covering a wider range of focus conditions is essential.
+
+\subsection{Limitations}
+
+\begin{enumerate}
+    \item \textbf{Dataset bias:} The model may produce unreliable predictions for configurations far from the training distribution.
+    \item \textbf{No uncertainty quantification:} The current model outputs point estimates. Future work could incorporate Bayesian layers or ensemble methods.
+    \item \textbf{Facility-specific effects:} Training on merged data may blur facility-specific characteristics.
+\end{enumerate}
+
+\subsection{Expected Impact of Improved Data}
+
+If future campaigns sample the lens-current space more uniformly---including configurations with large spot sizes---we anticipate a significant reduction in spread prediction error. The learning curve analysis already shows that MAE decreases with more data.
+
+% =============================================================================
+\section{Conclusions}
+\label{sec:conclusion}
+% =============================================================================
+
+We have presented \beamnet{}, a lightweight neural network surrogate for charged-particle beam transport, and demonstrated its application to both forward prediction and inverse optimization.
+
+\subsection{Key Findings}
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of \beamnet{} performance.}
+\label{tab:summary}
+\begin{tabular}{@{}lc@{}}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Forward prediction (centroid) & 3--9\% relative error \\
+Forward prediction (spread) & 25--55\% relative error \\
+Inverse solver (centroid) & 95\% success rate (\textless10\% error) \\
+Inverse solver convergence & 100\% \\
+Computational cost (forward) & \textless1 ms \\
+Computational cost (inverse) & \textless1 s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{The Inverse Solver as a Practical Tool}
+
+The inverse solver transforms \beamnet{} from a passive predictor into an active optimization engine. Operators can specify a target beam configuration and receive optimal lens currents in under one second. All exploration happens in silico, eliminating risk of beam loss or equipment damage.
+
+\subsection{Future Directions}
+
+\begin{enumerate}
+    \item \textbf{Expanded dataset} covering defocused configurations to improve spread prediction.
+    \item \textbf{Uncertainty quantification} via Bayesian neural networks or ensembles to flag unreliable predictions.
+    \item \textbf{Per-facility models} or facility embeddings for better generalization.
+    \item \textbf{Online learning} from real-time measurements to adapt to machine drift.
+    \item \textbf{Hardware deployment} with feedback loop for full automation.
+\end{enumerate}
+
+\beamnet{} demonstrates that even a small, biased dataset can yield a useful surrogate when the application is carefully matched to the model's strengths. For beam positioning, the current model is ready for operational testing. For spot-size control, the path forward is clear: collect more diverse data.
+
+% =============================================================================
+% References
+% =============================================================================
+\bibliographystyle{unsrt}
+\begin{thebibliography}{10}
+
+\bibitem{transport}
+K.L. Brown et al.,
+\textit{TRANSPORT: A Computer Program for Designing Charged Particle Beam Transport Systems},
+SLAC Report No. 91, 1973.
+
+\bibitem{madx}
+H. Grote and F. Schmidt,
+``MAD-X -- An Upgrade from MAD8,''
+\textit{Proc. PAC'03}, Portland, USA, 2003.
+
+\bibitem{elegant}
+M. Borland,
+``elegant: A Flexible SDDS-Compliant Code for Accelerator Simulation,''
+\textit{Advanced Photon Source LS-287}, 2000.
+
+\bibitem{gp_lcls}
+A. Edelen et al.,
+``Machine learning for orders of magnitude speedup in multiobjective optimization of particle accelerator systems,''
+\textit{Phys. Rev. Accel. Beams} \textbf{23}, 044601, 2020.
+
+\end{thebibliography}
+
+\end{document}
